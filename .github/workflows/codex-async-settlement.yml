@@ -1,0 +1,254 @@
+name: Signals settlement ownership validation
+on:
+  push:
+    branches: [codex/validate-async-settlement]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: peterolkhov/signals
+          ref: 3d9ed94be3c4c49d336d7151bc265bd60708e3ab
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify exact candidate, base, original blobs and three-file scope
+        run: |
+          python3 - <<'SIGNALS_INITIAL'
+          import hashlib, pathlib, subprocess
+          expected_commit = "3d9ed94be3c4c49d336d7151bc265bd60708e3ab"
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == expected_commit
+          raw = pathlib.Path('.changeset/fair-pages-settle.md').read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == '95e3fefb92bc557a36b61de575282b79005b56be4a69c66d924aebc1c518d859'
+          assert hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == '8e320fcd3d24d89c2596e359a26b23c1081f3034'
+          raw = pathlib.Path('packages/core/src/index.ts').read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == 'a4185280e1c26be381019d12f3c678bc8e323ecde0632439e8e21df0a264468d'
+          assert hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == '8ba93256754ddeeb5e849efe5936b999846b3f5a'
+          raw = pathlib.Path('packages/core/test/async.test.tsx').read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == '21297666ae1be2bc616c0101e231acfc5afc74ee1eba91f8caa9e7f54051eea0'
+          assert hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == '9e300a35bf41130656f98edf900ffc4a989f9d2b'
+          print("Exact candidate HEAD and all three file SHA256/Git blobs verified.")
+          base = "0e888794dec90ea60fd7724e2bece11b15cdc6fc"
+          assert subprocess.check_output(["git", "rev-parse", "HEAD^"], text=True).strip() == base
+          changed = sorted(subprocess.check_output(["git", "diff", "--name-only", base, "HEAD"], text=True).splitlines())
+          assert changed == ['.changeset/fair-pages-settle.md', 'packages/core/src/index.ts', 'packages/core/test/async.test.tsx']
+          assert not subprocess.check_output(["git", "diff", "--name-only"], text=True).strip()
+          assert not subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard"], text=True).strip()
+          assert subprocess.check_output(["git", "rev-parse", base + ":packages/core/src/index.ts"], text=True).strip() == 'bb05590c50e2eb852af5b117d9ae511cbacc2cfa'
+          assert subprocess.check_output(["git", "rev-parse", base + ":packages/core/test/async.test.tsx"], text=True).strip() == 'efa8a7e8246752027346e7670000ed167b87f1fc'
+          assert subprocess.run(["git", "cat-file", "-e", base + ":.changeset/fair-pages-settle.md"], stderr=subprocess.DEVNULL).returncode != 0
+          print("Exact base, original blobs, clean candidate, and only owner/test/new changeset confirmed.")
+          SIGNALS_INITIAL
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093
+        with:
+          version: 11.3.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Restore only original owner for native regression baseline
+        run: |
+          git show 0e888794dec90ea60fd7724e2bece11b15cdc6fc:packages/core/src/index.ts > packages/core/src/index.ts
+          test "$(git hash-object packages/core/src/index.ts)" = bb05590c50e2eb852af5b117d9ae511cbacc2cfa
+          test "$(git diff --name-only)" = packages/core/src/index.ts
+          pnpm build:core
+      - name: Confirm only the two new cases fail on original owner
+        run: |
+          set +e
+          pnpm exec vitest run packages/core/test/async.test.tsx --reporter=json --outputFile=signals-baseline.json
+          baseline_status=$?
+          set -e
+          test "$baseline_status" -eq 1
+          node --input-type=module <<'SIGNALS_BASELINE'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          const report = JSON.parse(fs.readFileSync('signals-baseline.json', 'utf8'));
+          assert.equal(report.numTotalTests, 13);
+          assert.equal(report.numPassedTests, 11);
+          assert.equal(report.numFailedTests, 2);
+          const failures = report.testResults.flatMap(test => test.assertionResults).filter(test => test.status === 'failed');
+          assert.equal(failures.length, 2);
+          assert.ok(failures.every(test => test.fullName.includes('preserves the next settlement when a consumer starts a run after')));
+          console.log('Native regression baseline: 11 existing passed; both new cases failed.');
+          SIGNALS_BASELINE
+      - name: Restore exact candidate and install unchanged public fixture
+        run: |
+          git restore --source=HEAD -- packages/core/src/index.ts
+          cat > packages/core/before-fixture.mjs <<'SIGNALS_FIXTURE'
+          // Place in upstream packages/core after its ordinary build:core command.
+          import assert from 'node:assert/strict';
+          import { asyncComputed, effect, signal } from '@preact/signals-core';
+          
+          function deferred() {
+            let resolve;
+            const promise = new Promise(r => { resolve = r; });
+            return { promise, resolve };
+          }
+          
+          async function flush() {
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+          }
+          
+          // Control: ordinary settlement exposes one stable promise through completion.
+          {
+            const request = deferred();
+            const result = asyncComputed(() => request.promise);
+            const settlement = result.settlement;
+            assert.ok(settlement instanceof Promise);
+            assert.equal(result.settlement, settlement);
+            assert.equal(result.pending.value, true);
+            request.resolve('ordinary');
+            await settlement;
+            assert.equal(result.value, 'ordinary');
+            assert.equal(result.pending.value, false);
+            assert.equal(result.settlement, undefined);
+            result.dispose();
+          }
+          
+          // Control: an independent input update retains the new run's settlement.
+          {
+            const page = signal(0);
+            const requests = [deferred(), deferred()];
+            const result = asyncComputed(() => requests[page.value].promise);
+            const first = result.settlement;
+            page.value = 1;
+            const second = result.settlement;
+            assert.ok(second instanceof Promise);
+            assert.notEqual(second, first);
+            await first;
+            assert.equal(result.pending.value, true);
+            assert.equal(result.settlement, second);
+            requests[1].resolve('second');
+            await second;
+            assert.equal(result.value, 'second');
+            assert.equal(result.pending.value, false);
+            result.dispose();
+            requests[0].resolve('stale');
+            await flush();
+            assert.equal(result.value, 'second');
+          }
+          
+          // A result consumer requests another page after the first page arrives.
+          {
+            const page = signal(0);
+            const requests = [deferred(), deferred()];
+            const result = asyncComputed(() => requests[page.value].promise);
+            const first = result.settlement;
+            let second;
+            let secondResolved = false;
+            const stop = effect(() => {
+              if (result.value === 'first') page.value = 1;
+            });
+            const stopPending = effect(() => {
+              if (page.value === 1 && result.pending.value) {
+                second = result.settlement;
+                second?.then(() => { secondResolved = true; });
+              }
+            });
+            requests[0].resolve('first');
+            await first;
+            await flush();
+            const observed = {
+              page: page.peek(),
+              value: result.peek(),
+              pending: result.pending.peek(),
+              hasSecondPromise: second instanceof Promise,
+              secondPromiseStillCurrent: result.settlement === second,
+              secondResolvedBeforeRequest: secondResolved,
+            };
+            console.log('reentrant settlement:', JSON.stringify(observed));
+            // The second request has not resolved. Its settlement must remain pending
+            // and publicly reachable until requests[1].resolve() below.
+            assert.equal(observed.page, 1);
+            assert.equal(observed.pending, true);
+            assert.equal(observed.hasSecondPromise, true);
+            assert.equal(observed.secondPromiseStillCurrent, true);
+            assert.equal(observed.secondResolvedBeforeRequest, false);
+            requests[1].resolve('second');
+            await second;
+            assert.equal(result.value, 'second');
+            assert.equal(result.pending.value, false);
+            stopPending();
+            stop();
+            result.dispose();
+          }
+          SIGNALS_FIXTURE
+          python3 - <<'SIGNALS_RESTORED'
+          import hashlib, pathlib, subprocess
+          expected_commit = "3d9ed94be3c4c49d336d7151bc265bd60708e3ab"
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == expected_commit
+          raw = pathlib.Path('.changeset/fair-pages-settle.md').read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == '95e3fefb92bc557a36b61de575282b79005b56be4a69c66d924aebc1c518d859'
+          assert hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == '8e320fcd3d24d89c2596e359a26b23c1081f3034'
+          raw = pathlib.Path('packages/core/src/index.ts').read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == 'a4185280e1c26be381019d12f3c678bc8e323ecde0632439e8e21df0a264468d'
+          assert hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == '8ba93256754ddeeb5e849efe5936b999846b3f5a'
+          raw = pathlib.Path('packages/core/test/async.test.tsx').read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == '21297666ae1be2bc616c0101e231acfc5afc74ee1eba91f8caa9e7f54051eea0'
+          assert hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == '9e300a35bf41130656f98edf900ffc4a989f9d2b'
+          print("Exact candidate HEAD and all three file SHA256/Git blobs verified.")
+          assert not subprocess.check_output(["git", "diff", "--name-only"], text=True).strip()
+          assert sorted(subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard"], text=True).splitlines()) == ["packages/core/before-fixture.mjs", "signals-baseline.json"]
+          assert hashlib.sha256(pathlib.Path("packages/core/before-fixture.mjs").read_bytes()).hexdigest() == "b81909896260df6e6fe8d5c06af5663f9d0fa32028b8d697bb50785da32dcab3"
+          print("Restored candidate tracked files clean; unchanged public fixture SHA256 verified.")
+          SIGNALS_RESTORED
+      - name: Official complete build
+        run: pnpm build
+      - name: Check formatting of changed files
+        run: pnpm exec oxfmt --check packages/core/src/index.ts packages/core/test/async.test.tsx .changeset/fair-pages-settle.md
+      - name: Official lint
+        run: pnpm lint
+      - name: Native async computed regression and controls
+        run: pnpm exec vitest run packages/core/test/async.test.tsx
+      - name: Unchanged public package regression fixture
+        run: timeout 30s node packages/core/before-fixture.mjs
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install chromium
+      - name: Official tests
+        run: pnpm test && pnpm test:devtools-ui
+      - name: Official production build tests
+        run: pnpm test:minify
+      - name: Official React production build tests
+        run: pnpm test:prod
+      - name: Prepare runtime with React 16
+        working-directory: packages/react/runtime
+        run: pnpm i react@16 react-dom@16 react-router-dom@5
+      - name: Official React 16 tests
+        working-directory: packages/react
+        run: |
+          pnpm i react@16 react-dom@16 react-router-dom@5
+          pnpm -w exec cross-env COVERAGE=true MINIFY=true vitest run packages/react
+      - name: Verify final source hashes and restore recorded compatibility-only changes
+        if: always()
+        run: |
+          python3 - <<'SIGNALS_FINAL'
+          import hashlib, pathlib, subprocess
+          expected_commit = "3d9ed94be3c4c49d336d7151bc265bd60708e3ab"
+          assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == expected_commit
+          raw = pathlib.Path('.changeset/fair-pages-settle.md').read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == '95e3fefb92bc557a36b61de575282b79005b56be4a69c66d924aebc1c518d859'
+          assert hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == '8e320fcd3d24d89c2596e359a26b23c1081f3034'
+          raw = pathlib.Path('packages/core/src/index.ts').read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == 'a4185280e1c26be381019d12f3c678bc8e323ecde0632439e8e21df0a264468d'
+          assert hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == '8ba93256754ddeeb5e849efe5936b999846b3f5a'
+          raw = pathlib.Path('packages/core/test/async.test.tsx').read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == '21297666ae1be2bc616c0101e231acfc5afc74ee1eba91f8caa9e7f54051eea0'
+          assert hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == '9e300a35bf41130656f98edf900ffc4a989f9d2b'
+          print("Exact candidate HEAD and all three file SHA256/Git blobs verified.")
+          assert hashlib.sha256(pathlib.Path("packages/core/before-fixture.mjs").read_bytes()).hexdigest() == "b81909896260df6e6fe8d5c06af5663f9d0fa32028b8d697bb50785da32dcab3"
+          compatibility_files = ["packages/react/runtime/package.json", "packages/react/package.json", "pnpm-lock.yaml"]
+          changed = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
+          assert set(changed).issubset(compatibility_files), changed
+          print("Compatibility-only tracked differences:", changed)
+          diff = subprocess.check_output(["git", "diff", "--", *compatibility_files], text=True)
+          pathlib.Path("signals-react16-compatibility.diff").write_text(diff)
+          print(diff)
+          subprocess.run(["git", "restore", "--source=HEAD", "--", *compatibility_files], check=True)
+          assert not subprocess.check_output(["git", "diff", "--name-only"], text=True).strip()
+          print("Candidate tracked source clean after recording and restoring React 16 compatibility installs.")
+          SIGNALS_FINAL
