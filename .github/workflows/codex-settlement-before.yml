@@ -1,0 +1,131 @@
+name: Signals native before proof
+on:
+  push:
+    branches: [codex/diagnose-async-settlement]
+permissions:
+  contents: read
+jobs:
+  before:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: preactjs/signals
+          ref: 0e888794dec90ea60fd7724e2bece11b15cdc6fc
+          persist-credentials: false
+      - uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093
+        with:
+          version: 11.3.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm build:core
+      - name: Existing native async computed tests
+        run: pnpm exec vitest run packages/core/test/async.test.tsx
+      - name: Public package regression fixture
+        timeout-minutes: 1
+        run: |
+          cat > packages/core/before-fixture.mjs <<'SIGNALS_FIXTURE'
+          // Place in upstream packages/core after its ordinary build:core command.
+          import assert from 'node:assert/strict';
+          import { asyncComputed, effect, signal } from '@preact/signals-core';
+          
+          function deferred() {
+            let resolve;
+            const promise = new Promise(r => { resolve = r; });
+            return { promise, resolve };
+          }
+          
+          async function flush() {
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+          }
+          
+          // Control: ordinary settlement exposes one stable promise through completion.
+          {
+            const request = deferred();
+            const result = asyncComputed(() => request.promise);
+            const settlement = result.settlement;
+            assert.ok(settlement instanceof Promise);
+            assert.equal(result.settlement, settlement);
+            assert.equal(result.pending.value, true);
+            request.resolve('ordinary');
+            await settlement;
+            assert.equal(result.value, 'ordinary');
+            assert.equal(result.pending.value, false);
+            assert.equal(result.settlement, undefined);
+            result.dispose();
+          }
+          
+          // Control: an independent input update retains the new run's settlement.
+          {
+            const page = signal(0);
+            const requests = [deferred(), deferred()];
+            const result = asyncComputed(() => requests[page.value].promise);
+            const first = result.settlement;
+            page.value = 1;
+            const second = result.settlement;
+            assert.ok(second instanceof Promise);
+            assert.notEqual(second, first);
+            await first;
+            assert.equal(result.pending.value, true);
+            assert.equal(result.settlement, second);
+            requests[1].resolve('second');
+            await second;
+            assert.equal(result.value, 'second');
+            assert.equal(result.pending.value, false);
+            result.dispose();
+            requests[0].resolve('stale');
+            await flush();
+            assert.equal(result.value, 'second');
+          }
+          
+          // A result consumer requests another page after the first page arrives.
+          {
+            const page = signal(0);
+            const requests = [deferred(), deferred()];
+            const result = asyncComputed(() => requests[page.value].promise);
+            const first = result.settlement;
+            let second;
+            let secondResolved = false;
+            const stop = effect(() => {
+              if (result.value === 'first') page.value = 1;
+            });
+            const stopPending = effect(() => {
+              if (page.value === 1 && result.pending.value) {
+                second = result.settlement;
+                second?.then(() => { secondResolved = true; });
+              }
+            });
+            requests[0].resolve('first');
+            await first;
+            await flush();
+            const observed = {
+              page: page.peek(),
+              value: result.peek(),
+              pending: result.pending.peek(),
+              hasSecondPromise: second instanceof Promise,
+              secondPromiseStillCurrent: result.settlement === second,
+              secondResolvedBeforeRequest: secondResolved,
+            };
+            console.log('reentrant settlement:', JSON.stringify(observed));
+            // The second request has not resolved. Its settlement must remain pending
+            // and publicly reachable until requests[1].resolve() below.
+            assert.equal(observed.page, 1);
+            assert.equal(observed.pending, true);
+            assert.equal(observed.hasSecondPromise, true);
+            assert.equal(observed.secondPromiseStillCurrent, true);
+            assert.equal(observed.secondResolvedBeforeRequest, false);
+            requests[1].resolve('second');
+            await second;
+            assert.equal(result.value, 'second');
+            assert.equal(result.pending.value, false);
+            stopPending();
+            stop();
+            result.dispose();
+          }
+          SIGNALS_FIXTURE
+          timeout 30s node packages/core/before-fixture.mjs
